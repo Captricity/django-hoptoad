@@ -18,6 +18,9 @@ from hoptoad.api.htv1 import _parse_message
 logger = logging.getLogger(__name__)
 
 def _handle_errors(request, response, exception):
+    """
+    Generates a class/message tuple 
+    """
     if response:
         code = "Http%s" % response
         msg = "%(code)s: %(response)s at %(uri)s" % {
@@ -35,9 +38,20 @@ def _handle_errors(request, response, exception):
         _exc, inst = sys.exc_info()[:2]
 
     return inst.__class__.__name__, _parse_message(inst)
+    
+def _request_data(request):
+    view_func = resolve(request.path)[0]
+    
+    return {
+        'url'          : request.build_absolute_uri(),
+        'component'    : view_func.__module__,
+        'action'       : view_func.__name__,
+        'params'       : _parse_request(request).items(),
+        'session'      : _parse_session(request.session).iteritems() if hasattr(request, 'session') else None,
+        'cgi-data'     : _parse_environment(request).iteritems(),
+    }
 
-
-def generate_payload(request, response=None, exception=None):
+def generate_payload(request, response=None, exception = None, exc_tb = None):
     """Generate an XML payload for a Hoptoad notification.
 
     Arguments:
@@ -51,10 +65,20 @@ def generate_payload(request, response=None, exception=None):
                    required to be reported.
 
     """
+    exception = exception or sys.exc_info()[1]
+    exc_tb    = exc_tb or sys.exc_info()[2]
+    
+    exc_class, exc_msg = _handle_errors(request, response, exception)
+    
+    return hoptoad_xml(exc_class, exc_msg, exc_tb, _request_data(request))
 
+def hoptoad_xml(exc_class, exc_msg, exc_tb = None, request_data = None):
+    """
+    Generates the XML document from the given required and optional 
+    
+    Request data is a dict of the appropriate items from a request object
+    """
     hoptoad_settings = get_hoptoad_settings()
-
-    p_error_class, p_message = _handle_errors(request, response, exception)
 
     # api v2 from: http://help.hoptoadapp.com/faqs/api-2/notifier-api-v2
     xdoc = getDOMImplementation().createDocument(None, "notice", None)
@@ -83,7 +107,7 @@ def generate_payload(request, response=None, exception=None):
     # /notice/error/class
     # /notice/error/message
     error = xdoc.createElement('error')
-    for key, value in zip(["class", "message"], [p_error_class, p_message]):
+    for key, value in zip(["class", "message"], [exc_class, exc_msg]):
         key = xdoc.createElement(key)
         value = xdoc.createTextNode(value)
         key.appendChild(value)
@@ -92,18 +116,11 @@ def generate_payload(request, response=None, exception=None):
     # /notice/error/backtrace/error/line
     backtrace = xdoc.createElement('backtrace')
 
-    # i do this here because I'm afraid of circular reference..
-    reversed_backtrace = None
-    try:
-        reversed_backtrace = traceback.extract_tb(sys.exc_info()[2])
+    # It's possible to not have a traceback on user-defined exceptions
+    if exc_tb:
+        reversed_backtrace = traceback.extract_tb(exc_tb)
         reversed_backtrace.reverse()
-    except AttributeError:
-        # if exception doesn't have a stack trace, then it might be a
-        # custom made exception.
-        # TODO: figure out how to do this cleanly
-        pass
 
-    if reversed_backtrace:
         for filename, lineno, funcname, _text in reversed_backtrace:
             line = xdoc.createElement('line')
             line.setAttribute('file', str(filename))
@@ -117,64 +134,66 @@ def generate_payload(request, response=None, exception=None):
         line.setAttribute('method', 'unknown')
         backtrace.appendChild(line)
     error.appendChild(backtrace)
+
     notice.appendChild(error)
 
     # /notice/request
-    xrequest = xdoc.createElement('request')
+    if request_data:
+        xrequest = xdoc.createElement('request')
 
-    # /notice/request/url -- request.build_absolute_uri()
-    xurl = xdoc.createElement('url')
-    xurl_data = xdoc.createTextNode(request.build_absolute_uri())
-    xurl.appendChild(xurl_data)
-    xrequest.appendChild(xurl)
+        # /notice/request/url -- request.build_absolute_uri()
+        xurl = xdoc.createElement('url')
+        xurl_data = xdoc.createTextNode(request_data['url'])
+        xurl.appendChild(xurl_data)
+        xrequest.appendChild(xurl)
 
-    view_func = resolve(request.path)[0]
+        # /notice/request/component -- component where error occured
+        comp = xdoc.createElement('component')
+        comp_data = xdoc.createTextNode(request_data['component'])
+        comp.appendChild(comp_data)
+        xrequest.appendChild(comp)
 
-    # /notice/request/component -- component where error occured
-    comp = xdoc.createElement('component')
-    comp_data = xdoc.createTextNode(view_func.__module__)
-    comp.appendChild(comp_data)
-    xrequest.appendChild(comp)
+        # /notice/request/action -- action which error occured
+        action = xdoc.createElement('action')
+        action_data = xdoc.createTextNode(request_data['action'])
+        action.appendChild(action_data)
+        xrequest.appendChild(action)
 
-    # /notice/request/action -- action which error occured
-    action = xdoc.createElement('action')
-    action_data = xdoc.createTextNode(view_func.__name__)
-    action.appendChild(action_data)
-    xrequest.appendChild(action)
+        # /notice/request/params/var -- check request.GET/request.POST
+        req_params = request_data.get('params', None)
+        if req_params:
+            params = xdoc.createElement('params')
+            for key, value in req_params:
+                var = xdoc.createElement('var')
+                var.setAttribute('key', key)
+                value = xdoc.createTextNode(str(value.encode('ascii', 'replace')))
+                var.appendChild(value)
+                params.appendChild(var)
+            xrequest.appendChild(params)
 
-    # /notice/request/params/var -- check request.GET/request.POST
-    req_params = _parse_request(request).items()
-    if req_params:
-        params = xdoc.createElement('params')
-        for key, value in req_params:
-            var = xdoc.createElement('var')
-            var.setAttribute('key', key)
-            value = xdoc.createTextNode(str(value.encode('ascii', 'replace')))
-            var.appendChild(value)
-            params.appendChild(var)
-        xrequest.appendChild(params)
+        # /notice/request/session/var -- check if sessions is enabled..
+        if request_data.get("session", None):
+            sessions = xdoc.createElement('session')
+            for key, value in request_data['session']:
+                var = xdoc.createElement('var')
+                var.setAttribute('key', key)
+                value = xdoc.createTextNode(str(value.encode('ascii', 'replace')))
+                var.appendChild(value)
+                sessions.appendChild(var)
+            xrequest.appendChild(sessions)
 
-    # /notice/request/session/var -- check if sessions is enabled..
-    if hasattr(request, "session"):
-        sessions = xdoc.createElement('session')
-        for key, value in _parse_session(request.session).iteritems():
-            var = xdoc.createElement('var')
-            var.setAttribute('key', key)
-            value = xdoc.createTextNode(str(value.encode('ascii', 'replace')))
-            var.appendChild(value)
-            sessions.appendChild(var)
-        xrequest.appendChild(sessions)
+        # /notice/request/cgi-data/var -- all meta data
+        if request_data.get('cgi-data', None):
+            cgidata = xdoc.createElement('cgi-data')
+            for key, value in request_data['cgi-data']:
+                var = xdoc.createElement('var')
+                var.setAttribute('key', key)
+                value = xdoc.createTextNode(str(value.encode('ascii', 'replace')))
+                var.appendChild(value)
+                cgidata.appendChild(var)
+            xrequest.appendChild(cgidata)
 
-    # /notice/request/cgi-data/var -- all meta data
-    cgidata = xdoc.createElement('cgi-data')
-    for key, value in _parse_environment(request).iteritems():
-        var = xdoc.createElement('var')
-        var.setAttribute('key', key)
-        value = xdoc.createTextNode(str(value.encode('ascii', 'replace')))
-        var.appendChild(value)
-        cgidata.appendChild(var)
-    xrequest.appendChild(cgidata)
-    notice.appendChild(xrequest)
+        notice.appendChild(xrequest)
 
     # /notice/server-environment
     serverenv = xdoc.createElement('server-environment')
@@ -200,6 +219,7 @@ def generate_payload(request, response=None, exception=None):
     notice.appendChild(serverenv)
     
     return xdoc.toxml('utf-8')
+
 
 def _ride_the_toad(payload, timeout, use_ssl):
     """Send a notification (an HTTP POST request) to Hoptoad.
