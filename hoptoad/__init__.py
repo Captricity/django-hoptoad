@@ -31,5 +31,8 @@ def report_error(exception, traceback = None, timeout = get_hoptoad_settings().g
     from hoptoad.handlers import get_handler
     from hoptoad.api import htv2
     
-    payload = htv2.hoptoad_xml(exception.__class__.__name__, unicode(exception), traceback, request_data)
+    exception_message = unicode(exception)
+    if not exception_message:
+        exception_message = str(exception)
+    payload = htv2.hoptoad_xml(exception.__class__.__name__, exception_message, traceback, request_data)
     get_handler().enqueue(payload, timeout)
